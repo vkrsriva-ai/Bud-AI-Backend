@@ -59,6 +59,17 @@ Rules:
 - All money values are numbers, not strings, rounded to 2 decimals.
 - If you cannot read the receipt at all, return {"error": "unreadable"}.`;
 
+// TEMPORARY diagnostic — tells us if the key is reaching the code. Remove later.
+app.get('/keycheck', (req, res) => {
+  const k = process.env.ANTHROPIC_API_KEY;
+  res.json({
+    keyPresent: !!k,
+    length: k ? k.length : 0,
+    startsWith: k ? k.slice(0, 7) : null,
+    hasWhitespace: k ? /\s/.test(k) : false,
+  });
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'BuD AI backend is running' });
 });
