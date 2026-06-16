@@ -65,7 +65,7 @@ Decode abbreviations using context, especially the price and tax code:
 For each item add "confidence": "high" or "low". Use "low" when the name was hard to read or the category is a guess — these become 1-tap user corrections later.
 
 === OUTPUT ===
-Return ONLY a JSON object, no markdown, no commentary, in exactly this shape:
+Your entire response must be ONE JSON object and nothing else. Do not write any sentence before or after it. Do not use markdown code fences. Start your response with the character "{" and end it with "}". Use exactly this shape:
 {
   "merchant": "store name",
   "items": [
@@ -106,7 +106,7 @@ app.post('/analyze', upload.single('receipt'), async (req, res) => {
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 3000,
+      max_tokens: 4096,
       messages: [
         {
           role: 'user',
@@ -118,19 +118,36 @@ app.post('/analyze', upload.single('receipt'), async (req, res) => {
       ],
     });
 
-    // Pull the text out and parse it. Strip code fences just in case.
-    const raw = message.content
+    // Pull the text out of the response.
+    let raw = message.content
       .filter((b) => b.type === 'text')
       .map((b) => b.text)
       .join('')
-      .replace(/```json|```/g, '')
       .trim();
+
+    // Strip markdown code fences if present.
+    raw = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+    // Robust extraction: the model sometimes adds a sentence before/after the JSON.
+    // Grab everything from the first "{" to the last "}" so surrounding prose is ignored.
+    let jsonText = raw;
+    const firstBrace = raw.indexOf('{');
+    const lastBrace = raw.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      jsonText = raw.slice(firstBrace, lastBrace + 1);
+    }
 
     let parsed;
     try {
-      parsed = JSON.parse(raw);
+      parsed = JSON.parse(jsonText);
     } catch (e) {
-      return res.status(502).json({ error: 'Model did not return valid JSON', raw });
+      // Log the raw response so we can see what the model actually returned.
+      console.error('JSON parse failed. Raw model output was:\n', raw);
+      return res.status(502).json({
+        error: 'Model did not return valid JSON',
+        parse_error: e.message,
+        raw,
+      });
     }
 
     if (parsed.error) {
