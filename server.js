@@ -85,6 +85,114 @@ RULES:
 - All money values are numbers, rounded to 2 decimals.
 - If you cannot read the receipt at all, return {"error": "unreadable"}.`;
 
+// ---- Helpers ----
+const round = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+// Call the model with the file and a given instruction, return parsed JSON (or throws).
+async function callModel(fileBlock, instructionText) {
+  const message = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 4096,
+    messages: [
+      { role: 'user', content: [fileBlock, { type: 'text', text: instructionText }] },
+    ],
+  });
+
+  let raw = message.content
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text)
+    .join('')
+    .trim()
+    .replace(/```json/gi, '')
+    .replace(/```/g, '')
+    .trim();
+
+  const firstBrace = raw.indexOf('{');
+  const lastBrace = raw.lastIndexOf('}');
+  const jsonText =
+    firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace
+      ? raw.slice(firstBrace, lastBrace + 1)
+      : raw;
+
+  try {
+    return JSON.parse(jsonText);
+  } catch (e) {
+    const err = new Error('Model did not return valid JSON');
+    err.raw = raw;
+    err.parseError = e.message;
+    throw err;
+  }
+}
+
+// Take parsed model output and compute totals, category breakdown, and verification.
+function verify(parsed) {
+  const items = Array.isArray(parsed.items) ? parsed.items : [];
+  const computedSubtotal = round(items.reduce((s, it) => s + (Number(it.price) || 0), 0));
+
+  const categoryTotals = {};
+  for (const it of items) {
+    const cat = it.category || 'Other';
+    categoryTotals[cat] = round((categoryTotals[cat] || 0) + (Number(it.price) || 0));
+  }
+
+  const printedSubtotal = parsed.printed_subtotal != null ? round(parsed.printed_subtotal) : null;
+  const subtotalMatches =
+    printedSubtotal != null && Math.abs(computedSubtotal - printedSubtotal) < 0.01;
+
+  const taxChecks = [];
+  for (const t of parsed.tax_breakdown || []) {
+    if (t == null || t.code == null || t.rate == null) continue;
+    const base = round(
+      items
+        .filter((it) => (it.tax_code || '').toUpperCase() === String(t.code).toUpperCase())
+        .reduce((s, it) => s + (Number(it.price) || 0), 0)
+    );
+    const expected = round(base * (Number(t.rate) / 100));
+    const printedAmt = t.amount != null ? round(t.amount) : null;
+    taxChecks.push({
+      code: t.code,
+      rate: t.rate,
+      coded_item_base: base,
+      expected_tax: expected,
+      printed_tax: printedAmt,
+      matches: printedAmt != null && Math.abs(expected - printedAmt) < 0.02,
+    });
+  }
+  const allTaxMatch = taxChecks.length > 0 && taxChecks.every((c) => c.matches);
+  const lowConfidenceItems = items.filter((it) => it.confidence === 'low').map((it) => it.name);
+
+  return {
+    items,
+    categoryTotals,
+    computedSubtotal,
+    printedSubtotal,
+    subtotalMatches,
+    taxChecks,
+    allTaxMatch,
+    lowConfidenceItems,
+  };
+}
+
+// Build the constraint-aware retry instruction: hand the model the hard targets it must hit.
+function buildRetryPrompt(parsed, v) {
+  const taxTargets = (parsed.tax_breakdown || [])
+    .filter((t) => t && t.code != null && t.rate != null)
+    .map((t) => {
+      const targetBase = t.amount != null ? round((Number(t.amount) / Number(t.rate)) * 100) : null;
+      return `  - Items coded "${t.code}" must sum to about ${targetBase} (because ${t.code} is taxed at ${t.rate}% and the printed ${t.code} tax is ${t.amount}).`;
+    })
+    .join('\n');
+
+  return `${PROMPT}
+
+=== SECOND-PASS RECONCILIATION (important) ===
+A first reading of this receipt did NOT reconcile. Your previous item prices summed to ${v.computedSubtotal}, but the printed subtotal is ${v.printedSubtotal}. You misread one or more LINE PRICES — most likely in a cramped or crossed-out section. Re-read the price column very carefully, digit by digit.
+
+You MUST satisfy these hard constraints from the receipt's own printed totals:
+  - All item prices (after discounts) must sum to exactly ${v.printedSubtotal}.
+${taxTargets ? taxTargets + '\n' : ''}Use these targets to find your misread: if a tax-code group is off, the wrong price is in that group. Adjust ONLY the price(s) you misread until both the subtotal and every tax-code group reconcile. Do not invent items or change correct prices. Return the same JSON shape as before.`;
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'BuD AI backend is running' });
 });
@@ -98,128 +206,69 @@ app.post('/analyze', upload.single('receipt'), async (req, res) => {
     const base64Data = req.file.buffer.toString('base64');
     const mediaType = req.file.mimetype || 'image/jpeg';
     const isPdf = mediaType === 'application/pdf' || (req.file.originalname || '').toLowerCase().endsWith('.pdf');
-
-    // Build the right content block: PDFs go as a "document", images as an "image".
     const fileBlock = isPdf
       ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64Data } }
       : { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Data } };
 
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 4096,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            fileBlock,
-            { type: 'text', text: PROMPT },
-          ],
-        },
-      ],
-    });
-
-    // Pull the text out of the response.
-    let raw = message.content
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
-      .join('')
-      .trim();
-
-    // Strip markdown code fences if present.
-    raw = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
-
-    // Robust extraction: the model sometimes adds a sentence before/after the JSON.
-    // Grab everything from the first "{" to the last "}" so surrounding prose is ignored.
-    let jsonText = raw;
-    const firstBrace = raw.indexOf('{');
-    const lastBrace = raw.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      jsonText = raw.slice(firstBrace, lastBrace + 1);
-    }
-
+    // ---- First pass ----
     let parsed;
     try {
-      parsed = JSON.parse(jsonText);
+      parsed = await callModel(fileBlock, PROMPT);
     } catch (e) {
-      // Log the raw response so we can see what the model actually returned.
-      console.error('JSON parse failed. Raw model output was:\n', raw);
-      return res.status(502).json({
-        error: 'Model did not return valid JSON',
-        parse_error: e.message,
-        raw,
-      });
+      console.error('First-pass parse failed:\n', e.raw || e.message);
+      return res.status(502).json({ error: e.message, parse_error: e.parseError, raw: e.raw });
     }
+    if (parsed.error) return res.json(parsed); // e.g. unreadable
 
-    if (parsed.error) {
-      return res.json(parsed); // e.g. {"error":"unreadable"}
+    let v = verify(parsed);
+    let attempts = 1;
+    let usedSecondPass = false;
+
+    // ---- Second pass: only if the first didn't reconcile and we have a subtotal to target ----
+    if (!v.subtotalMatches && v.printedSubtotal != null) {
+      usedSecondPass = true;
+      attempts = 2;
+      try {
+        const retryPrompt = buildRetryPrompt(parsed, v);
+        const parsed2 = await callModel(fileBlock, retryPrompt);
+        if (!parsed2.error) {
+          const v2 = verify(parsed2);
+          // Keep the second pass only if it's actually better (closer to the printed subtotal).
+          const firstDiff = Math.abs(v.computedSubtotal - v.printedSubtotal);
+          const secondDiff =
+            v2.printedSubtotal != null ? Math.abs(v2.computedSubtotal - v2.printedSubtotal) : Infinity;
+          if (secondDiff <= firstDiff) {
+            parsed = parsed2;
+            v = v2;
+          }
+        }
+      } catch (e) {
+        console.error('Second-pass failed, keeping first result:\n', e.raw || e.message);
+        // Fall through with the first-pass result.
+      }
     }
-
-    // === VERIFICATION LAYER ===
-    // We don't trust the model's arithmetic. We compute everything from the items
-    // ourselves, build category_totals, and flag any mismatch against the printed numbers.
-    const round = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-    const items = Array.isArray(parsed.items) ? parsed.items : [];
-
-    // Sum the line items (discounts are already netted into prices by the prompt).
-    const computedSubtotal = round(items.reduce((sum, it) => sum + (Number(it.price) || 0), 0));
-
-    // Build category_totals from the items, not from the model.
-    const categoryTotals = {};
-    for (const it of items) {
-      const cat = it.category || 'Other';
-      categoryTotals[cat] = round((categoryTotals[cat] || 0) + (Number(it.price) || 0));
-    }
-
-    // Compare our computed subtotal to what the receipt printed.
-    const printedSubtotal = parsed.printed_subtotal != null ? round(parsed.printed_subtotal) : null;
-    const subtotalMatches =
-      printedSubtotal != null && Math.abs(computedSubtotal - printedSubtotal) < 0.01;
-
-    // Tax-code cross-check: for each printed tax line (e.g. A 8% = 6.88), sum the
-    // item prices carrying that code and verify base * rate ≈ printed amount.
-    // This independently confirms items were read and coded correctly.
-    const taxChecks = [];
-    for (const t of parsed.tax_breakdown || []) {
-      if (t == null || t.code == null || t.rate == null) continue;
-      const base = round(
-        items
-          .filter((it) => (it.tax_code || '').toUpperCase() === String(t.code).toUpperCase())
-          .reduce((sum, it) => sum + (Number(it.price) || 0), 0)
-      );
-      const expected = round(base * (Number(t.rate) / 100));
-      const printedAmt = t.amount != null ? round(t.amount) : null;
-      taxChecks.push({
-        code: t.code,
-        rate: t.rate,
-        coded_item_base: base,
-        expected_tax: expected,
-        printed_tax: printedAmt,
-        matches: printedAmt != null && Math.abs(expected - printedAmt) < 0.02,
-      });
-    }
-    const allTaxMatch = taxChecks.length > 0 && taxChecks.every((c) => c.matches);
-
-    // Collect anything the user might want to review.
-    const lowConfidenceItems = items
-      .filter((it) => it.confidence === 'low')
-      .map((it) => it.name);
 
     const response = {
       merchant: parsed.merchant || 'Unknown',
-      items,
-      category_totals: categoryTotals,
-      computed_subtotal: computedSubtotal,
-      printed_subtotal: printedSubtotal,
+      items: v.items,
+      category_totals: v.categoryTotals,
+      computed_subtotal: v.computedSubtotal,
+      printed_subtotal: v.printedSubtotal,
       printed_tax: parsed.printed_tax != null ? round(parsed.printed_tax) : null,
       printed_total: parsed.printed_total != null ? round(parsed.printed_total) : null,
       tax_breakdown: parsed.tax_breakdown || [],
       verification: {
-        subtotal_matches: subtotalMatches,
-        difference: printedSubtotal != null ? round(computedSubtotal - printedSubtotal) : null,
-        tax_code_checks: taxChecks,
-        tax_codes_reconcile: allTaxMatch,
-        low_confidence_items: lowConfidenceItems,
-        needs_review: !subtotalMatches || lowConfidenceItems.length > 0,
+        subtotal_matches: v.subtotalMatches,
+        difference: v.printedSubtotal != null ? round(v.computedSubtotal - v.printedSubtotal) : null,
+        tax_code_checks: v.taxChecks,
+        tax_codes_reconcile: v.allTaxMatch,
+        low_confidence_items: v.lowConfidenceItems,
+        attempts,
+        used_second_pass: usedSecondPass,
+        needs_review: !v.subtotalMatches || v.lowConfidenceItems.length > 0,
+        review_message: !v.subtotalMatches
+          ? `This receipt still doesn't add up (off by ${round(v.computedSubtotal - v.printedSubtotal)}). Please review the flagged line prices.`
+          : null,
       },
     };
 
