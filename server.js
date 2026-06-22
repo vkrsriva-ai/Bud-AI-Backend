@@ -4,7 +4,7 @@ const { buildResponse } = require('./reconcile');
 const { EXTRACTION_PROMPT, correctionPrompt } = require('./prompt');
 
 const app = express();
-app.use(express.json({ limit: '15mb' })); // base64 receipt photos are large
+app.use(express.json({ limit: '25mb' })); // base64 photos and multi-page PDFs are large
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -12,6 +12,40 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MODEL_FAST = process.env.MODEL_FAST || 'claude-sonnet-4-6';
 const MODEL_STRONG = process.env.MODEL_STRONG || 'claude-opus-4-8';
 const MAX_ATTEMPTS = 2;
+
+// What we accept, split by how Claude must receive it.
+const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+const PDF_TYPE = 'application/pdf';
+
+// Map sloppy/missing mediaType to a canonical one using the filename extension.
+const EXT_TO_TYPE = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  pdf: 'application/pdf',
+};
+
+function normalizeMediaType(mediaType, filename) {
+  if (mediaType && (IMAGE_TYPES.includes(mediaType) || mediaType === PDF_TYPE)) {
+    return mediaType;
+  }
+  if (filename) {
+    const ext = String(filename).split('.').pop().toLowerCase();
+    if (EXT_TO_TYPE[ext]) return EXT_TO_TYPE[ext];
+  }
+  return null;
+}
+
+// PDFs go in a 'document' block (reads selectable PDF text natively);
+// jpg/png/etc go in an 'image' block.
+function buildMediaBlock(base64, mediaType) {
+  if (mediaType === PDF_TYPE) {
+    return { type: 'document', source: { type: 'base64', media_type: PDF_TYPE, data: base64 } };
+  }
+  return { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } };
+}
 
 // Pull the first {...last} block out of a model response, tolerating stray prose or ``` fences.
 function extractJson(text) {
@@ -29,9 +63,9 @@ function textFrom(msg) {
 // Core logic, with an injectable createMessage so the retry loop is testable without the live API.
 async function analyzeReceipt(imageBase64, mediaType, deps = {}) {
   const createMessage = deps.createMessage || ((args) => anthropic.messages.create(args));
-  const imageBlock = { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } };
+  const mediaBlock = buildMediaBlock(imageBase64, mediaType);
 
-  const messages = [{ role: 'user', content: [imageBlock, { type: 'text', text: EXTRACTION_PROMPT }] }];
+  const messages = [{ role: 'user', content: [mediaBlock, { type: 'text', text: EXTRACTION_PROMPT }] }];
 
   let attempts = 0;
   let usedSecondPass = false;
@@ -74,11 +108,23 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/analyze', async (req, res) => {
   try {
-    const { image, mediaType } = req.body || {};
+    const { image, mediaType, filename } = req.body || {};
     if (!image || typeof image !== 'string') {
-      return res.status(400).json({ error: 'missing_image', message: 'Send { image: <base64>, mediaType: "image/jpeg" }' });
+      return res.status(400).json({
+        error: 'missing_image',
+        message: 'Send { image: <base64>, mediaType: "image/jpeg" | "image/png" | "application/pdf" }',
+      });
     }
-    const result = await analyzeReceipt(image, mediaType || 'image/jpeg');
+
+    const resolvedType = normalizeMediaType(mediaType, filename);
+    if (!resolvedType) {
+      return res.status(400).json({
+        error: 'unsupported_type',
+        message: `Unsupported mediaType "${mediaType || '(none)'}". Use one of: ${[...IMAGE_TYPES, PDF_TYPE].join(', ')}.`,
+      });
+    }
+
+    const result = await analyzeReceipt(image, resolvedType);
     if (result.error) return res.status(422).json(result);
     return res.json(result);
   } catch (err) {
