@@ -12,7 +12,9 @@ const asFraction = (rate) => {
   return r >= 1 ? r / 100 : r;
 };
 
-const FOOD_CATS = new Set(['Grocery & Food']); // GA: only true grocery gets the low rate
+// State-agnostic: the lowest printed tax rate on the receipt is treated as the "food" rate,
+// and only true grocery maps to it. Works in any state because rates come from the receipt itself.
+const FOOD_CATS = new Set(['Grocery & Food']);
 
 function reconcile(parsed) {
   const items = Array.isArray(parsed.items) ? parsed.items : [];
@@ -46,7 +48,7 @@ function reconcile(parsed) {
 
     // (a) try matching by the literal per-line code
     const byCode = items.filter((it) => normCode(it.tax_code) === code);
-    // (b) fallback when literal codes don't line up: low rate -> food cats, high rate -> the rest
+    // (b) fallback when literal codes don't line up: lowest printed rate -> food cats, higher -> the rest
     const isLowRate = rateFrac <= minRate;
     const byCategory = items.filter((it) =>
       isLowRate ? FOOD_CATS.has(it.category) : !FOOD_CATS.has(it.category)
