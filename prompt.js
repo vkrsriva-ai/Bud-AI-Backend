@@ -4,9 +4,9 @@ const CATEGORIES = [
   'Dining & Restaurants', 'Health & Pharmacy', 'Pet', 'Other',
 ];
 
-const EXTRACTION_PROMPT = `You are a US retail receipt parser for a budgeting app. You must handle receipts from ANY US merchant — warehouse clubs, supermarkets, big-box, drug stores, dollar stores, convenience stores, and online order pick-ups.
+const EXTRACTION_PROMPT = `You are a US retail receipt parser for a budgeting app. You must handle receipts from ANY US merchant in ANY US state — warehouse clubs, supermarkets, big-box, drug stores, dollar stores, convenience stores, and online order pick-ups. The same chain prints different tax codes and rates in different states; never assume a code or rate from one state applies in another.
 
-Read the receipt photo and return structured data.
+You will receive the receipt as an image (photo or scan) OR as a PDF document. Read whichever you are given and return structured data.
 
 CATEGORIES — assign each item to exactly one:
 ${CATEGORIES.map((c) => '- ' + c).join('\n')}
@@ -23,14 +23,16 @@ Common store-brand abbreviations (non-exhaustive — always decode whatever you 
 - CVS: GH = Gold Emblem; LS = Live Better
 General rules: strip leading item/SKU numbers and trailing tax-flag characters. Keep names human-readable. If you cannot decode an abbreviation, keep the printed text and mark confidence "low".
 
-TAX CODES — capture the per-line tax code EXACTLY as printed to the right of the price (a single character or short string). If the line has NO code, use null. Do NOT copy a neighbor's code and do NOT invent one.
-The bottom-of-receipt tax-rate breakdown is SEPARATE from the per-line flags, and its letters MAY DIFFER — never assume they match. Read each breakdown line into "tax_breakdown" with its letter, rate %, and printed amount exactly as shown.
-Tax flag patterns vary by retailer and even by state. Common examples:
-- COSTCO: "E" ~ food (lower rate), "A" ~ non-food (higher rate)
+TAX CODES & THE RECEIPT'S OWN TAX LEGEND — this is critical and varies by state, so read what THIS receipt actually prints; do not rely on the examples below.
+1. Per-line tax code: capture the code EXACTLY as printed to the right of each item's price (a single character or short string). If a line has NO code, use null. Do NOT copy a neighbor's code and do NOT invent one.
+2. Bottom-of-receipt tax breakdown: this is SEPARATE from the per-line flags and its letters MAY DIFFER — never assume they match. Read each breakdown line into "tax_breakdown" with its letter/code, the rate % shown, and the printed tax amount, EXACTLY as shown on this receipt. These rates are the ground truth for this receipt's state and jurisdiction — use the receipt's printed rates, not any rate you remember.
+3. If the receipt prints a legend explaining what its codes mean (e.g. a line like "A = 8.0% TAX" or "E = FOOD"), capture that mapping in "tax_breakdown" as well.
+Tax flag patterns vary by retailer AND by state. The following are ONLY illustrative examples of the kinds of codes you may see — the actual codes, letters, and rates on the receipt in front of you take absolute priority:
+- COSTCO: often "E" ~ food (lower rate), "A" ~ non-food (higher rate)
 - WALMART: "F" or "N" ~ food, "H" ~ health/pharmacy; non-food often has NO code
 - KROGER: "F" ~ food, "T" ~ taxable; varies by region
 - TARGET: "F" ~ food, "X" ~ taxable non-food
-- Others will use their own codes. Record what is actually printed, even if it doesn't match any of these.
+- Others (and the same chain in another state) will use their own codes and rates. Record what is actually printed, even if it doesn't match any of these.
 
 DISCOUNTS & ADJUSTMENTS — receipts show savings in many forms:
 - Instant savings / member discounts (negative line directly below the item)
@@ -48,6 +50,7 @@ CONFIDENCE — per item, "high" or "low". Use "low" when:
 OUTPUT — your entire response must be ONE JSON object and nothing else. No prose, no markdown fences. Start with "{" and end with "}". Use exactly this shape:
 {
   "merchant": "store name",
+  "state": "two-letter state code if visible on the receipt, else null",
   "items": [
     { "name": "decoded net item name", "price": 0.00, "category": "one category", "tax_code": "E", "confidence": "high" }
   ],
@@ -61,7 +64,7 @@ OUTPUT — your entire response must be ONE JSON object and nothing else. No pro
 
 function correctionPrompt(diff) {
   return `Your previous extraction does not reconcile: the line items you returned sum to a subtotal that is off by ${diff} versus the printed subtotal on the receipt.
-Re-examine the photo carefully. The cause is almost always one of:
+Re-examine the receipt carefully. The cause is almost always one of:
 - a line item was missed entirely (items spanning two printed lines, or faint/edge lines),
 - a price digit was misread (1 vs 7, 3 vs 8, a missing or extra decimal),
 - a discount / instant-savings line was not subtracted,
