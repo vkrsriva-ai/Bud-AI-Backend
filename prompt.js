@@ -11,6 +11,8 @@ You will receive the receipt as an image (photo or scan) OR as a PDF document. R
 CATEGORIES — assign each item to exactly one:
 ${CATEGORIES.map((c) => '- ' + c).join('\n')}
 
+ITEM NUMBER — many receipts (warehouse clubs especially) print a number beside each line: a product/SKU number for items, and the SAME number on the discount line that applies to that item. Capture it as "item_number", EXACTLY as printed. This is how a discount is matched back to its product. If a line has no number, use null. A discount line that reprints its product's number MUST carry that same number.
+
 ITEM NAMES — receipts abbreviate heavily. Decode into a readable product name a normal person would recognize.
 Common store-brand abbreviations (non-exhaustive — always decode whatever you see):
 - COSTCO: KS / KIRK = Kirkland Signature
@@ -24,7 +26,7 @@ Common store-brand abbreviations (non-exhaustive — always decode whatever you 
 General rules: strip leading item/SKU numbers and trailing tax-flag characters. Keep names human-readable. If you cannot decode an abbreviation, keep the printed text and mark confidence "low".
 
 TAX CODES & THE RECEIPT'S OWN TAX LEGEND — this is critical and varies by state, so read what THIS receipt actually prints; do not rely on the examples below.
-1. Per-line tax code: capture the code EXACTLY as printed to the right of each item's price (a single character or short string). If a line has NO code, use null. Do NOT copy a neighbor's code and do NOT invent one.
+1. Per-line tax code: capture the tax/category code for the line EXACTLY as printed. IMPORTANT: the code's POSITION varies by retailer and state — it may appear to the RIGHT of the price, to the LEFT of the description, between the description and the price, or anywhere on the line. Scan the WHOLE line and capture the code wherever it sits. It is usually a single letter or short string (e.g. E, A, F, N, H, FD, X). If the line genuinely has NO code anywhere, use null. Do NOT copy a neighbor's code and do NOT invent one.
 2. Bottom-of-receipt tax breakdown: this is SEPARATE from the per-line flags and its letters MAY DIFFER — never assume they match. Read each breakdown line into "tax_breakdown" with its letter/code, the rate % shown, and the printed tax amount, EXACTLY as shown on this receipt. These rates are the ground truth for this receipt's state and jurisdiction — use the receipt's printed rates, not any rate you remember.
 3. If the receipt prints a legend explaining what its codes mean (e.g. a line like "A = 8.0% TAX" or "E = FOOD"), capture that mapping in "tax_breakdown" as well.
 Tax flag patterns vary by retailer AND by state. The following are ONLY illustrative examples of the kinds of codes you may see — the actual codes, letters, and rates on the receipt in front of you take absolute priority:
@@ -52,7 +54,7 @@ OUTPUT — your entire response must be ONE JSON object and nothing else. No pro
   "merchant": "store name",
   "state": "two-letter state code if visible on the receipt, else null",
   "items": [
-    { "name": "decoded net item name", "price": 0.00, "category": "one category", "tax_code": "E", "confidence": "high" }
+    { "name": "decoded net item name", "item_number": "3226685", "price": 0.00, "category": "one category", "tax_code": "E", "confidence": "high" }
   ],
   "tax_breakdown": [
     { "code": "A", "rate": 8.0, "amount": 0.00 }
