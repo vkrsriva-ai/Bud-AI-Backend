@@ -20,6 +20,9 @@ const FOOD_CATS = new Set(['Grocery & Food']);
 // Rule A from the validation run: food tax rate applies to Grocery, BUT pet food maps to Pet
 // and prepared/restaurant food maps to Dining. For the cross-check, a line is "food-rate-expected"
 // if it is Grocery, Pet, or Dining. Anything else expects the non-food (higher) rate.
+// NOTE (6/26): taxonomy is now 13 categories. Alcohol, Tools/Hardware, and Gas & Transport are all
+// NON-food-rate, so they are intentionally absent here. Gas is often 0%-rated or separately taxed;
+// the layered-tax handling below keeps that from creating false review flags.
 const FOOD_RATE_CATS = new Set(['Grocery & Food', 'Pet', 'Dining & Restaurants']);
 // ===== end T1.4 (support) =====
 
@@ -29,19 +32,28 @@ const FOOD_RATE_CATS = new Set(['Grocery & Food', 'Pet', 'Dining & Restaurants']
 // Discounts with no matching parent stay as-is (the prompt already routes orphan discounts to "Other").
 // DISPLAY = netted (handled downstream): we DO NOT merge the line away — the negative line is kept
 // in storage so a future "you saved $X" tally can sum it. We only fix its CATEGORY here.
-function applyDiscountInheritance(rawItems) {
+//
+// RETURNS (6/26): on a refund receipt the sign convention is MIRRORED. Returned items are NEGATIVE
+// (money back) and clawed-back discounts are POSITIVE (they reduce the refund). So when
+// isReturn is true, the "parent" line is the negative one and the "discount" line is the positive one.
+// We flip the sign test accordingly; everything else (inherit category, mark is_discount) is identical.
+function applyDiscountInheritance(rawItems, isReturn = false) {
   const items = rawItems.map((it) => ({ ...it })); // shallow copy so we never mutate caller's objects
 
-  // Index the most recent positive-price line per item_number (the parent product).
+  // On a purchase, parents have price > 0 and discounts < 0. On a return, that flips.
+  const isParentPrice = (p) => (isReturn ? num(p) < 0 : num(p) > 0);
+  const isDiscountPrice = (p) => (isReturn ? num(p) > 0 : num(p) < 0);
+
+  // Index the most recent parent line per item_number.
   const parentByNumber = new Map();
   for (const it of items) {
     const n = it.item_number == null ? null : String(it.item_number).trim();
-    if (n && num(it.price) > 0) parentByNumber.set(n, it);
+    if (n && isParentPrice(it.price)) parentByNumber.set(n, it);
   }
 
   for (const it of items) {
     const n = it.item_number == null ? null : String(it.item_number).trim();
-    const isDiscount = num(it.price) < 0;
+    const isDiscount = isDiscountPrice(it.price);
     if (isDiscount && n && parentByNumber.has(n)) {
       const parent = parentByNumber.get(n);
       it.category = parent.category;      // inherit parent's category
@@ -58,8 +70,17 @@ function applyDiscountInheritance(rawItems) {
 function reconcile(parsed) {
   const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
 
+  // ===== Return detection (6/26): a refund receipt mirrors every sign. =====
+  // Trust the prompt's transaction_type first; fall back to a negative printed total as a safety net.
+  const transactionType =
+    String(parsed.transaction_type || '').toLowerCase() === 'return'
+      ? 'return'
+      : (num(parsed.printed_total) < 0 ? 'return' : 'purchase');
+  const isReturn = transactionType === 'return';
+  // ===== end return detection =====
+
   // ===== T1.1 (pairing half): run discount inheritance before any totals =====
-  const items = applyDiscountInheritance(rawItems);
+  const items = applyDiscountInheritance(rawItems, isReturn);
   // Product count excludes discount lines (a discount is not a purchased product).
   const productCount = items.filter((it) => !it.is_discount).length;
   // ===== end T1.1 =====
@@ -176,36 +197,60 @@ function reconcile(parsed) {
     .filter(({ it }) => String(it.confidence || '').toLowerCase() === 'low')
     .map(({ i, it }) => ({ index: i, name: it.name, price: num(it.price) }));
 
+  // ===== Internal tax log (6/26): merchants compute tax correctly ~100% of the time, and real
+  // receipts use layered/overlapping tax bases (a base rate on everything + a surcharge on a subset,
+  // e.g. prepared food). Our simple one-rate-one-category model can't model overlap, so a "mismatch"
+  // here is usually BENIGN (layered tax), occasionally a real miscategorization signal. Decision:
+  // do NOT surface tax/cross-check mismatches to the USER. Keep computing them and emit them on an
+  // internal channel so they can be reviewed during validation. Turn this off post-launch. =====
+  const taxInternalLog =
+    (taxMismatch || crossCheckMismatch)
+      ? {
+          reason: 'tax_or_crosscheck_mismatch_silenced',
+          note: 'Likely layered/overlapping tax bases (benign) or a real miscategorization. User NOT notified; logged for validation.',
+          subtotal_reconciled: subtotalMatches,        // if subtotal still ties, the math is trustworthy
+          tax_mismatch: taxMismatch,
+          cross_check_mismatch: crossCheckMismatch,
+          cross_check_flags: crossCheckFlags,
+          tax_checks: taxChecks,
+        }
+      : null;
+  // ===== end internal tax log =====
+
   return { items, productCount, categoryTotals, computedSubtotal, printedSubtotal, subtotalDiff,
            subtotalMatches, taxChecks, codesMatchedSomething, allTaxMatch, taxCheckRan, taxMismatch,
-           crossCheckFlags, crossCheckMismatch, lowConfidenceItems };
+           crossCheckFlags, crossCheckMismatch, lowConfidenceItems,
+           transactionType, taxInternalLog };
 }
 
 function buildResponse(parsed) {
   const v = reconcile(parsed);
   const moneyOk = v.subtotalMatches !== false; // null (no printed subtotal) does NOT block
 
-  // ===== T1.5: review now fires on tax mismatch and cross-check mismatch too (not just subtotal) =====
-  const needsReview = !moneyOk
-    || v.lowConfidenceItems.length > 0
-    || v.taxMismatch
-    || v.crossCheckMismatch;
+  // ===== Review triggers (REVISED 6/26) =====
+  // SUPERSEDES the earlier 6/23 rule. Tax mismatch and cross-check mismatch NO LONGER notify the user:
+  // merchants compute tax correctly ~100% of the time and the usual cause of a "mismatch" is layered
+  // tax bases (benign). They are still computed and emitted on the internal log (taxInternalLog) for
+  // our own validation review. The user is only asked to review things they can actually act on:
+  //   1) the receipt's MONEY doesn't add up (subtotal mismatch), or
+  //   2) an item was flagged low-confidence (a 1-tap "Needs Review" item).
+  const needsReview = !moneyOk || v.lowConfidenceItems.length > 0;
 
-  // Build a single human-readable review message, most-serious-first.
+  // Human-readable review message, most-serious-first. (Label shown to the user is "Needs Review".)
   let reviewMessage = null;
   if (!moneyOk) {
     reviewMessage = `Receipt doesn't add up (off by ${v.subtotalDiff}). Check the flagged line prices.`;
   } else if (v.lowConfidenceItems.length > 0) {
     reviewMessage = `${v.lowConfidenceItems.length} item(s) need a quick confirm.`;
-  } else if (v.crossCheckMismatch) {
-    reviewMessage = `${v.crossCheckFlags.length} item(s) may be in the wrong category — the receipt's tax doesn't match the category. Quick check?`;
-  } else if (v.taxMismatch) {
-    reviewMessage = `The tax on this receipt didn't reconcile cleanly. Worth a quick look.`;
   }
-  // ===== end T1.5 =====
+  // ===== end review triggers =====
 
   return {
     merchant: parsed.merchant || 'Unknown',
+    transaction_type: v.transactionType,        // 6/26: 'purchase' or 'return'
+    date: parsed.date != null ? parsed.date : null,            // 6/26: launch-critical for trends
+    state: parsed.state != null ? parsed.state : null,
+    store_address: parsed.store_address != null ? parsed.store_address : null, // 6/26
     items: v.items,
     product_count: v.productCount,              // T1.1: excludes discount lines
     category_totals: v.categoryTotals,
@@ -220,13 +265,15 @@ function buildResponse(parsed) {
       tax_code_checks: v.taxChecks,
       tax_codes_reconcile: v.allTaxMatch,        // advisory, never blocks
       tax_codes_present: v.codesMatchedSomething,
-      tax_check_ran: v.taxCheckRan,              // T1.3/T1.5: was there anything to check?
-      tax_mismatch: v.taxMismatch,               // T1.5: did tax fail to reconcile?
-      category_cross_check_flags: v.crossCheckFlags, // T1.4: lines where category vs tax-rate disagree
+      tax_check_ran: v.taxCheckRan,
+      tax_mismatch: v.taxMismatch,               // still reported in data, but no longer triggers review
+      category_cross_check_flags: v.crossCheckFlags, // still reported in data
       low_confidence_items: v.lowConfidenceItems,
       needs_review: needsReview,
       review_message: reviewMessage,
     },
+    // 6/26: internal-only channel. NOT shown to the user. Review during validation; disable post-launch.
+    _internal_tax_log: v.taxInternalLog,
   };
 }
 
